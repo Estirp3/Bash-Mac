@@ -7,6 +7,30 @@
 # https://github.com/Estirp3
 # -----------------------------------------------
 
+# Función para manejo de errores
+handle_error() {
+    local error_msg="$1"
+    echo "❌ Error: $error_msg"
+    exit 1
+}
+
+# Función para verificar espacio disponible
+check_disk_space() {
+    local required_space=500 # MB
+    local available_space=$(df -m /opt | awk 'NR==2 {print $4}')
+    if [ "$available_space" -lt "$required_space" ]; then
+        handle_error "Espacio insuficiente en /opt. Se requieren ${required_space}MB, hay ${available_space}MB disponibles."
+    fi
+}
+
+# Función para validar permisos
+check_permissions() {
+    local dir="$1"
+    if [ ! -w "$dir" ]; then
+        handle_error "Sin permisos de escritura en $dir"
+    fi
+}
+
 PROFILE_D_FILE="/etc/profile.d/custom_env.sh"
 
 # 1. Variables para Java y Android
@@ -14,8 +38,16 @@ JAVA_HOME="/Library/Java/JavaVirtualMachines/jdk-11.jdk/Contents/Home"
 ANDROID_HOME='\$HOME/Library/Android/sdk'
 PATH_ANDROID='export PATH="$PATH:$ANDROID_HOME/emulator:$ANDROID_HOME/tools:$ANDROID_HOME/tools/bin:$ANDROID_HOME/platform-tools"'
 
+# Configuración de versiones y rutas
+config_file=".env"
+if [ -f "$config_file" ]; then
+    source "$config_file"
+else
+    MAVEN_VERSION="${MAVEN_VERSION:-3.9.6}"
+    MAVEN_CHECKSUM_URL="https://downloads.apache.org/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz.sha512"
+ fi
+
 # 2. Maven: Detectar, descomprimir o descargar e instalar (globalmente en /opt)
-MAVEN_VERSION="3.9.6"
 MAVEN_DIR="/opt/apache-maven-$MAVEN_VERSION"
 MAVEN_TGZ="/opt/apache-maven-$MAVEN_VERSION-bin.tar.gz"
 MAVEN_URL="https://dlcdn.apache.org/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz"
@@ -42,9 +74,25 @@ elif [ -f "$MAVEN_TGZ" ]; then
   echo "✅ Maven descomprimido en $MAVEN_DIR"
 else
   echo "⬇️  Descargando Maven $MAVEN_VERSION a $MAVEN_TGZ ..."
-  curl -L -o "$MAVEN_TGZ" "$MAVEN_URL"
-  tar -xzf "$MAVEN_TGZ" -C /opt
+  # Verificar espacio y permisos antes de descargar
+  check_disk_space
+  check_permissions "/opt"
+  
+  # Descargar con verificación SSL
+  curl -L --proto '=https' --tlsv1.2 -o "$MAVEN_TGZ" "$MAVEN_URL" || handle_error "Fallo en la descarga de Maven"
+  
+  # Verificar checksum
+  expected_checksum=$(curl -L --proto '=https' --tlsv1.2 "$MAVEN_CHECKSUM_URL" | cut -d' ' -f1)
+  actual_checksum=$(shasum -a 512 "$MAVEN_TGZ" | cut -d' ' -f1)
+  
+  if [ "$expected_checksum" != "$actual_checksum" ]; then
+      rm -f "$MAVEN_TGZ"
+      handle_error "Verificación de checksum fallida para Maven"
+  fi
+  
+  tar -xzf "$MAVEN_TGZ" -C /opt || handle_error "Error al descomprimir Maven"
   chown -R root:admin "$MAVEN_DIR"
+  chmod -R 755 "$MAVEN_DIR"
   M2_HOME="$MAVEN_DIR"
   echo "✅ Maven descargado y descomprimido en $MAVEN_DIR"
 fi
