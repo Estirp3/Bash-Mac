@@ -1,179 +1,237 @@
 #!/bin/bash
+# ------------------------------------------------------
+# Instala Java Temurin (versión elegida) + Maven (Homebrew)
+# Configura JAVA_HOME / M2_HOME / PATH
+# Flags: --user | --global  (+ opcional --java N; default 17)
+# IMPORTANTE: ejecutar SIN sudo (brew no corre como root).
+# By Estirp3 (Chapti)
+# ------------------------------------------------------
+set -euo pipefail
 
-# -----------------------------------------------
-# Script ultra-pro para setear entorno local con detección/descarga automática de Maven y plantilla para Java.
-# By Estirp3 
-# https://github.com/Estirp3
-# -----------------------------------------------
+# --------- Args ---------
+TARGET="user"          # user|global
+JAVA_REQ_VERSION="17"  # default
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user)   TARGET="user"; shift ;;
+    --global) TARGET="global"; shift ;;
+    --java)   JAVA_REQ_VERSION="${2:-}"; [[ -n "$JAVA_REQ_VERSION" ]] || { echo "Falta valor para --java"; exit 1; }; shift 2 ;;
+    [0-9]|1[0-9]|2[0-9]) JAVA_REQ_VERSION="$1"; shift ;;  # soporte posicional "21"
+    *) echo "Uso: $0 [--user|--global] [--java N]"; exit 1 ;;
+  esac
+done
 
-# Función para manejo de errores
-handle_error() {
-    local error_msg="$1"
-    echo "❌ Error: $error_msg"
-    exit 1
-}
+# --------- Const ---------
+PROFILE_D_DIR="/etc/profile.d"
+PROFILE_D_FILE="$PROFILE_D_DIR/custom_env.sh"
+USER_ZPROFILE="$HOME/.zprofile"
+PATH_MAVEN_EXPORT='export PATH="$PATH:$M2_HOME/bin"'
+BREW_USER="${SUDO_USER:-$USER}"
 
-# Función para verificar espacio disponible
-check_disk_space() {
-    local required_space=500 # MB
-    local available_space=$(df -m "$HOME/Downloads" | awk 'NR==2 {print $4}')
-    if [ "$available_space" -lt "$required_space" ]; then
-        handle_error "Espacio insuficiente en $HOME/Downloads. Se requieren ${required_space}MB, hay ${available_space}MB disponibles."
-    fi
-}
+# --------- Utils ---------
+is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
+is_mingw() { uname -s | grep -qiE 'mingw|msys|cygwin'; }
+arch()     { uname -m; }
+info()     { echo "➡️  $*"; }
+warn()     { echo "⚠️  $*" >&2; }
+die()      { echo "❌ $*" >&2; exit 1; }
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Función para hacer backup de configuración
-backup_config() {
-    local file="$1"
-    if [ -f "$file" ]; then
-        local backup="${file}.backup.$(date +%Y%m%d_%H%M%S)"
-        cp "$file" "$backup" || handle_error "No se pudo crear backup de $file"
-        echo "✅ Backup creado: $backup"
-    fi
-}
-
-# 1. Detecta shell usuario
-if [ -n "$ZSH_VERSION" ] || [ "$SHELL" = "/bin/zsh" ]; then
-  SHELL_RC="$HOME/.zshrc"
-elif [ -n "$BASH_VERSION" ] || [ "$SHELL" = "/bin/bash" ]; then
-  if [ -f "$HOME/.bash_profile" ]; then
-    SHELL_RC="$HOME/.bash_profile"
+as_brew_user() {
+  # Ejecuta comandos como usuario normal (nunca root)
+  if [[ "$USER" == "$BREW_USER" ]]; then
+    /bin/bash -lc "$*"
   else
-    SHELL_RC="$HOME/.bashrc"
+    sudo -u "$BREW_USER" /bin/bash -lc "$*"
   fi
-else
-  echo "❌ No detecté bash ni zsh. Si usas otro shell, agrega las variables manualmente."
-  exit 1
-fi
+}
 
-echo "👉 Usando archivo de configuración: $SHELL_RC"
-
-# Cargar configuración personalizada
-config_file=".env"
-if [ -f "$config_file" ]; then
-    source "$config_file"
-fi
-
-# 2. MAVEN
-MAVEN_VERSION="${MAVEN_VERSION:-3.9.6}"
-MAVEN_DIR="$HOME/Downloads/apache-maven-$MAVEN_VERSION"
-MAVEN_TGZ="$HOME/Downloads/apache-maven-$MAVEN_VERSION-bin.tar.gz"
-MAVEN_URL="https://dlcdn.apache.org/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz"
-MAVEN_CHECKSUM_URL="https://downloads.apache.org/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz.sha512"
-
-if command -v mvn >/dev/null 2>&1; then
-  echo "✔️ Maven ya está instalado: $(mvn -v | head -n 1)"
-  M2_HOME=$(dirname $(dirname $(command -v mvn)))
-elif [ -d "$MAVEN_DIR" ]; then
-  echo "✔️ Carpeta Maven ya existe en $MAVEN_DIR"
-  M2_HOME="$MAVEN_DIR"
-elif [ -f "$MAVEN_TGZ" ]; then
-  echo "💾 Archivo $MAVEN_TGZ ya descargado, descomprimiendo..."
-  tar -xzf "$MAVEN_TGZ" -C "$HOME/Downloads"
-  M2_HOME="$MAVEN_DIR"
-  echo "✅ Maven descomprimido en $MAVEN_DIR"
-else
-  echo "⬇️  Descargando Maven $MAVEN_VERSION..."
-  # Verificar espacio disponible
-  check_disk_space
-  
-  # Descargar con verificación SSL
-  curl -L --proto '=https' --tlsv1.2 -o "$MAVEN_TGZ" "$MAVEN_URL" || handle_error "Fallo en la descarga de Maven"
-  
-  # Verificar checksum
-  expected_checksum=$(curl -L --proto '=https' --tlsv1.2 "$MAVEN_CHECKSUM_URL" | cut -d' ' -f1)
-  actual_checksum=$(shasum -a 512 "$MAVEN_TGZ" | cut -d' ' -f1)
-  
-  if [ "$expected_checksum" != "$actual_checksum" ]; then
-      rm -f "$MAVEN_TGZ"
-      handle_error "Verificación de checksum fallida para Maven"
+require_sudo() {
+  # Pide credenciales sudo si no están cacheadas (solo cuando hace falta)
+  if ! sudo -n true 2>/dev/null; then
+    info "Se requieren privilegios para escribir en /etc…"
+    sudo -v
   fi
-  
-  tar -xzf "$MAVEN_TGZ" -C "$HOME/Downloads" || handle_error "Error al descomprimir Maven"
-  chmod -R 755 "$MAVEN_DIR"
-  M2_HOME="$MAVEN_DIR"
-  echo "✅ Maven descargado y descomprimido en $MAVEN_DIR"
-fi
+}
 
-PATH_MAVEN='export PATH="$PATH:$M2_HOME/bin"'
-
-# 3. JAVA
-# Puedes dejarlo así si ya tienes Java instalado, o adaptarlo para descarga automática.
-JAVA_HOME="/Library/Java/JavaVirtualMachines/jdk-11.jdk/Contents/Home"
-if [ -x "$JAVA_HOME/bin/java" ]; then
-  echo "✔️ Java encontrado en $JAVA_HOME"
-else
-  if command -v java >/dev/null 2>&1; then
-    echo "✔️ Java ya está instalado: $(java -version 2>&1 | head -n 1)"
-    JAVA_HOME="$(dirname $(dirname $(readlink $(command -v java))))"
-  else
-    echo "❗ No se encontró Java instalado ni en $JAVA_HOME"
-    echo "   Descarga manual de JDK requerida (por ahora, descarga automática no implementada)"
-    # Aquí podrías automatizar la descarga con curl/wget según la versión y origen (Adoptium, Oracle, etc)
-  fi
-fi
-
-# 4. ANDROID_HOME
-ANDROID_HOME="$HOME/Library/Android/sdk"
-PATH_ANDROID='export PATH="$PATH:$ANDROID_HOME/emulator:$ANDROID_HOME/tools:$ANDROID_HOME/tools/bin:$ANDROID_HOME/platform-tools"'
-
-# 5. Función para setear o actualizar variables en el shell del usuario
-set_or_update_env_var() {
-  local var="$1"
-  local value="$2"
-  local rc="$3"
-  
-  # Validar parámetros
-  if [ -z "$var" ] || [ -z "$value" ] || [ -z "$rc" ]; then
-    handle_error "Parámetros incompletos en set_or_update_env_var"
-  fi
-  
-  # Crear backup antes de modificar
-  backup_config "$rc"
-  
-  if grep -q "^export $var=" "$rc"; then
-    current_value=$(grep "^export $var=" "$rc" | sed -e "s/^export $var=//" -e 's/^"//' -e 's/"$//')
-    if [ "$current_value" != "$value" ]; then
-      echo "🔄 Corrigiendo $var (antes: $current_value, ahora: $value)"
-      sed -i '' "s|^export $var=.*|export $var=\"$value\"|" "$rc" || handle_error "Error al actualizar $var en $rc"
+ensure_zsh_loads_profiled() {
+  require_sudo
+  local line='[[ -f /etc/profile.d/custom_env.sh ]] && source /etc/profile.d/custom_env.sh'
+  for f in /etc/zprofile /etc/zshrc; do
+    if sudo test -f "$f"; then
+      sudo grep -Fq "$line" "$f" 2>/dev/null || echo "$line" | sudo tee -a "$f" >/dev/null
     else
-      echo "✔ $var ya estaba bien (no se modifica)"
+      echo "$line" | sudo tee -a "$f" >/dev/null
     fi
+  done
+}
+
+cleanup_env_lines() {
+  # Limpia definiciones previas de JAVA_HOME/M2_HOME/PATH mvn (global y usuario)
+  local files=("$PROFILE_D_FILE" /etc/zprofile /etc/zshrc "$HOME/.zprofile" "$HOME/.zshrc")
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || continue
+    if [[ "$f" == "$PROFILE_D_FILE" || "$f" == /etc/* ]]; then
+      require_sudo
+      sudo sed -i '' '/export[[:space:]]\+JAVA_HOME=/d' "$f" 2>/dev/null || true
+      sudo sed -i '' '/export[[:space:]]\+M2_HOME=/d'   "$f" 2>/dev/null || true
+      sudo sed -i '' '\|export PATH="$PATH:$M2_HOME/bin"|d' "$f" 2>/dev/null || true
+    else
+      sed -i '' '/export[[:space:]]\+JAVA_HOME=/d' "$f" 2>/dev/null || true
+      sed -i '' '/export[[:space:]]\+M2_HOME=/d'   "$f" 2>/dev/null || true
+      sed -i '' '\|export PATH="$PATH:$M2_HOME/bin"|d' "$f" 2>/dev/null || true
+    fi
+  done
+}
+
+append_or_replace_export_line_global() {
+  require_sudo
+  local var="$1" val="$2" file="$3"
+  sudo mkdir -p "$(dirname "$file")"
+  if ! sudo test -f "$file"; then
+    echo "# Global env (Chapti)" | sudo tee "$file" >/dev/null
+    sudo chmod 644 "$file"
+  fi
+  if sudo grep -qE "^[[:space:]]*export[[:space:]]+$var=" "$file" 2>/dev/null; then
+    sudo sed -i '' "s|^[[:space:]]*export[[:space:]]\+$var=.*|export $var=\"$val\"|" "$file"
   else
-    echo "➕ Agregando $var con valor: $value"
-    echo "export $var=\"$value\"" >> "$rc" || handle_error "Error al agregar $var a $rc"
+    echo "export $var=\"$val\"" | sudo tee -a "$file" >/dev/null
   fi
 }
 
-set_or_update_env_var "JAVA_HOME" "$JAVA_HOME" "$SHELL_RC"
-set_or_update_env_var "ANDROID_HOME" "$ANDROID_HOME" "$SHELL_RC"
-set_or_update_env_var "M2_HOME" "$M2_HOME" "$SHELL_RC"
+append_or_replace_export_line_user() {
+  local var="$1" val="$2" file="$3"
+  touch "$file"
+  if grep -qE "^[[:space:]]*export[[:space:]]+$var=" "$file" 2>/dev/null; then
+    sed -i '' "s|^[[:space:]]*export[[:space:]]\+$var=.*|export $var=\"$val\"|" "$file"
+  else
+    echo "export $var=\"$val\"" >> "$file"
+  fi
+}
 
-if ! grep -Fq "$PATH_ANDROID" "$SHELL_RC"; then
-  echo "➕ Agregando PATH extra para Android SDK"
-  echo "$PATH_ANDROID" >> "$SHELL_RC"
-else
-  echo "✔ PATH para Android SDK ya está bien"
-fi
+write_env_global() {
+  local java_home="$1" m2_home="$2"
+  append_or_replace_export_line_global "JAVA_HOME" "$java_home" "$PROFILE_D_FILE"
+  append_or_replace_export_line_global "M2_HOME"   "$m2_home"  "$PROFILE_D_FILE"
+  if ! sudo grep -Fq "$PATH_MAVEN_EXPORT" "$PROFILE_D_FILE"; then
+    echo "$PATH_MAVEN_EXPORT" | sudo tee -a "$PROFILE_D_FILE" >/dev/null
+  fi
+  ensure_zsh_loads_profiled
+  # Añadir mvn al PATH del sistema (best-effort)
+  echo "$m2_home/bin" | sudo tee /etc/paths.d/maven >/dev/null || true
+}
 
-if ! grep -Fq "$PATH_MAVEN" "$SHELL_RC"; then
-  echo "➕ Agregando PATH para Maven"
-  echo "$PATH_MAVEN" >> "$SHELL_RC"
-else
-  echo "✔ PATH para Maven ya está bien"
-fi
+write_env_user() {
+  local java_home="$1" m2_home="$2"
+  local zpf="$USER_ZPROFILE"
+  local zrc="$HOME/.zshrc"
+  touch "$zpf" "$zrc"
+  append_or_replace_export_line_user "JAVA_HOME" "$java_home" "$zpf"
+  append_or_replace_export_line_user "M2_HOME"   "$m2_home"  "$zpf"
+  grep -Fq "$PATH_MAVEN_EXPORT" "$zpf" 2>/dev/null || echo "$PATH_MAVEN_EXPORT" >> "$zpf"
+  grep -Fq 'source ~/.zprofile' "$zrc" 2>/dev/null || echo '[[ -f ~/.zprofile ]] && source ~/.zprofile' >> "$zrc"
+}
 
-# 6. Mostrar todo al usuario
-echo ""
-echo "🔍 Valores seteados:"
-echo "JAVA_HOME: $JAVA_HOME"
-echo "ANDROID_HOME: $ANDROID_HOME"
-echo "M2_HOME: $M2_HOME"
-echo "PATH extra Android: $PATH_ANDROID"
-echo "PATH extra Maven: $PATH_MAVEN"
-echo ""
-echo "✅ ¡Listo! Variables de entorno configuradas."
-echo "ℹ️  Ejecuta: source $SHELL_RC"
-echo "🔄 O abre una nueva terminal."
-echo ""
-echo "By Estirp3 😎"
+resolve_java_home_macos() {
+  /usr/libexec/java_home -v "$JAVA_REQ_VERSION" 2>/dev/null || /usr/libexec/java_home 2>/dev/null || true
+}
+
+# --------- macOS flow ---------
+macos_install_all() {
+  # Homebrew (si no está, instalar como usuario normal)
+  if ! as_brew_user "command -v brew >/dev/null 2>&1"; then
+    info "Instalando Homebrew (como $BREW_USER)…"
+    as_brew_user 'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    if [[ -x /opt/homebrew/bin/brew ]]; then eval "$(/opt/homebrew/bin/brew shellenv)"; fi
+    if [[ -x /usr/local/bin/brew ]];  then eval "$(/usr/local/bin/brew shellenv)";  fi
+  else
+    as_brew_user "brew update" || true
+  fi
+
+  # Java Temurin (cask name fix: temurin@N o temurin fallback)
+  local cask="temurin@${JAVA_REQ_VERSION}"
+  if ! as_brew_user "brew info --cask $cask >/dev/null 2>&1"; then
+    cask="temurin"
+  fi
+  info "Instalando Java ($cask)…"
+  as_brew_user "brew list --cask $cask >/dev/null 2>&1 || brew install --cask $cask"
+
+  # Resolver JAVA_HOME
+  local JAVA_HOME_VAL
+  JAVA_HOME_VAL="$(resolve_java_home_macos)"
+  [[ -n "${JAVA_HOME_VAL:-}" && -x "$JAVA_HOME_VAL/bin/java" ]] || die "No pude resolver JAVA_HOME tras instalar $cask."
+
+  # Maven
+  info "Instalando Maven…"
+  as_brew_user "brew list maven >/dev/null 2>&1 || brew install maven"
+
+  # M2_HOME (brew libexec)
+  local M2_HOME M_PREFIX MVN_PATH
+  M_PREFIX="$(as_brew_user "brew --prefix maven" | tr -d '\r')"
+  if [[ -n "$M_PREFIX" && -d "$M_PREFIX/libexec" ]]; then
+    M2_HOME="$M_PREFIX/libexec"
+  else
+    MVN_PATH="$(as_brew_user "command -v mvn" || true)"
+    [[ -n "$MVN_PATH" ]] || die "No pude encontrar mvn."
+    M2_HOME="$(as_brew_user "cd \"\$(dirname \"$MVN_PATH\")\" && cd .. && pwd")/libexec"
+  fi
+
+  echo
+  echo "🔍 Detectado:"
+  echo "JAVA_HOME = $JAVA_HOME_VAL"
+  echo "M2_HOME   = $M2_HOME"
+  echo
+
+  # Limpiar y escribir según target
+  cleanup_env_lines
+  if [[ "$TARGET" == "global" ]]; then
+    write_env_global "$JAVA_HOME_VAL" "$M2_HOME"
+    echo "✅ Global listo. Recarga: source /etc/profile.d/custom_env.sh"
+  else
+    write_env_user "$JAVA_HOME_VAL" "$M2_HOME"
+    echo "✅ Usuario listo. Recarga: source ~/.zprofile"
+  fi
+
+  echo
+  echo "Verificación (puede requerir nueva sesión):"
+  echo "  echo \$JAVA_HOME"
+  echo "  java -version"
+  echo "  mvn -v"
+}
+
+# --------- Windows guía ---------
+windows_guide() {
+  echo "🪟 Windows (Git-Bash/MSYS/Cygwin). Ejecuta en PowerShell (Admin):"
+  echo "  choco install temurin@${JAVA_REQ_VERSION} maven -y   (o 'temurin' si no hay @N)"
+  echo '  setx JAVA_HOME "C:\Program Files\Eclipse Adoptium\jdk-<ver>\\" /M'
+  echo '  setx M2_HOME "C:\ProgramData\chocolatey\lib\maven\tools\apache-maven-<ver>\\" /M'
+  echo '  setx PATH "%PATH%;%M2_HOME%\bin" /M'
+}
+
+# --------- Entrypoint ---------
+main() {
+  if is_macos; then
+    # Info chip
+    local CHIP="Intel"
+    if [[ "$(arch)" == "arm64" ]]; then
+      local brand; brand=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")
+      if   echo "$brand" | grep -q "M1"; then CHIP="Apple M1"
+      elif echo "$brand" | grep -q "M2"; then CHIP="Apple M2"
+      elif echo "$brand" | grep -q "M3"; then CHIP="Apple M3"
+      elif echo "$brand" | grep -q "M4"; then CHIP="Apple M4"
+      else CHIP="Apple Silicon (arm64)"
+      fi
+    fi
+    echo "🍎 macOS detectado - Chip: $CHIP"
+    echo "🔧 Java solicitado: Temurin $JAVA_REQ_VERSION"
+    macos_install_all
+  elif is_mingw; then
+    windows_guide
+  else
+    die "SO no soportado. Solo macOS y Windows (Git-Bash/MSYS/Cygwin)."
+  fi
+  echo
+  echo "By Estirp3 😎"
+}
+
+main "$@"
